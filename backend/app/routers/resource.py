@@ -97,6 +97,12 @@ from app.services.query_audit import QueryAuditService
 from app.services.cost_govern import CostGovernService
 from app.services.data_contract import DataContractService
 from app.services.semantic_model import SemanticModelService
+from app.services.mart_resume import (
+    MartRefreshInterrupted,
+    CachePartitionReader,
+    mart_resume_service,
+)
+from app.services.result_mart import ResultMartService
 
 source_svc = SourceRegistryService()
 semantic_svc = SemanticModelService()
@@ -205,6 +211,115 @@ def pipeline_export_to_mart(
     return {"ok": True, "pipeline": "export_to_mart",
             "export": exporter_svc.export_query_results(entry["id"]),
             "mart": exporter_svc.batch_export_to_mart(mart_id) if mart_id > 0 else None}
+
+
+# -- 分区级集市续做：刷新 / 重试 / 交付 / 可读范围 / 历史核验缺口 --
+
+def _build_reader(
+    empty_partitions: str, fail_partitions: str, fail_times: int
+) -> CachePartitionReader:
+    """按查询参数构造带场景的分区读取器：登记零行分区与瞬时失败分区。"""
+    reader = CachePartitionReader()
+    for partition in [p.strip() for p in empty_partitions.split(",") if p.strip()]:
+        reader.mark_empty(partition)
+    for partition in [p.strip() for p in fail_partitions.split(",") if p.strip()]:
+        reader.simulate_failure(partition, fail_times)
+    return reader
+
+
+@router.post("/pipelines/export-to-mart-refresh")
+def pipeline_export_mart_refresh(
+    partitions: str = Query(..., description="逗号分隔的分区列表"),
+    mart_id: int = Query(default=0),
+    batch_id: str | None = Query(default=None),
+    empty_partitions: str = Query(default="", description="确认为成功零行的分区"),
+    fail_partitions: str = Query(default="", description="模拟首次读取失败的分区"),
+    fail_times: int = Query(default=1, ge=1),
+    fail_after: int | None = Query(default=None, ge=1, description="处理多少分区后中断"),
+) -> dict[str, Any]:
+    reader = _build_reader(empty_partitions, fail_partitions, fail_times)
+    target_partitions = [p.strip() for p in partitions.split(",") if p.strip()]
+    try:
+        return exporter_svc.refresh_mart_partitions(
+            mart_id=mart_id,
+            partitions=target_partitions,
+            batch_id=batch_id,
+            reader=reader,
+            fail_after=fail_after,
+        )
+    except MartRefreshInterrupted as exc:
+        # 中断不是 5xx：检查点已落，返回续做所需的批次号与当前覆盖
+        return {
+            "ok": False,
+            "interrupted": True,
+            "pipeline": "export_to_mart_refresh",
+            "batch_id": exc.batch_id,
+            "message": str(exc),
+            "summary": exc.summary,
+        }
+
+
+@router.post("/pipelines/export-to-mart-resume")
+def pipeline_export_mart_resume(
+    mart_id: int = Query(...),
+    batch_id: str = Query(...),
+    empty_partitions: str = Query(default=""),
+    fail_partitions: str = Query(default=""),
+    fail_times: int = Query(default=1, ge=1),
+    fail_after: int | None = Query(default=None, ge=1),
+) -> dict[str, Any]:
+    reader = _build_reader(empty_partitions, fail_partitions, fail_times)
+    try:
+        return exporter_svc.resume_mart_refresh(
+            mart_id=mart_id,
+            batch_id=batch_id,
+            reader=reader,
+            fail_after=fail_after,
+        )
+    except MartRefreshInterrupted as exc:
+        return {
+            "ok": False,
+            "interrupted": True,
+            "pipeline": "export_to_mart_resume",
+            "batch_id": exc.batch_id,
+            "message": str(exc),
+            "summary": exc.summary,
+        }
+
+
+@router.post("/pipelines/export-to-mart-deliver")
+def pipeline_export_mart_deliver(batch_id: str = Query(...)) -> dict[str, Any]:
+    result = exporter_svc.deliver_partition_files(batch_id)
+    if not result["ok"]:
+        raise HTTPException(status_code=404, detail=result["message"])
+    result["pipeline"] = "export_to_mart_deliver"
+    return result
+
+
+@router.get("/pipelines/mart-coverage/{mart_id}")
+def pipeline_mart_coverage(mart_id: int) -> dict[str, Any]:
+    mart_svc = ResultMartService()
+    try:
+        readable = mart_svc.readable_range(mart_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {
+        "ok": True,
+        "pipeline": "mart_coverage",
+        "readable_range": readable,
+        "manifests": mart_resume_service.list_manifests_for_mart(mart_id),
+    }
+
+
+@router.post("/pipelines/mart-legacy-gap/{mart_id}")
+def pipeline_mart_legacy_gap(mart_id: int) -> dict[str, Any]:
+    mart_svc = ResultMartService()
+    try:
+        result = mart_svc.mark_legacy_gap(mart_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    result["pipeline"] = "mart_legacy_gap"
+    return result
 
 
 @router.post("/pipelines/lake-scan-register")

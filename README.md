@@ -81,5 +81,34 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 集市分区续做（分析导出 -> 结果集市）
+
+沿 `data_exporter` -> `result_mart` 调用链实现分区级刷新，解决整批中断后必须全量重扫、
+零行与取数失败无法区分的问题，核心代码在 `app/services/mart_resume.py`、
+`app/services/result_mart.py`、`app/services/data_exporter.py`。
+
+- **续做覆盖清单（ResumeManifest）**：每个刷新批次按分区登记状态检查点，中断后凭
+  `batch_id` 续做，只重建「待处理/取数失败」片段；成功终态（含成功零行）直接跳过、不重新扫描。
+- **零行与失败分别记录**：`成功零行` 是带扫描证据的成功终态；`取数失败` 不写证据（缺证据），
+  两类分区在清单、集市覆盖账本和交付文件里口径一致、可分别追溯。
+- **可读范围可解释**：集市 `分区覆盖` 账本逐分区记录实际提交明细。局部落地时状态为
+  「局部可读」并显式列出可读分区与缺口分区，未完成数据绝不空算；整批完整后才刷新权威行数。
+- **按清单交付**：`deliver_partition_files` 对有数据分区出数据文件、成功零行出 `.EMPTY.json`
+  零行标记、缺证据分区出 `.GAP.json` 缺口记录，交付与集市提交结果都回写任务清单。
+- **历史批兼容**：无分区级证据的历史集市用 `mart-legacy-gap` 标记核验缺口，
+  保留既有已出结果，不宣称完整覆盖。
+
+相关接口（均在 `/api/pipelines` 下）：
+
+| 接口 | 作用 |
+| --- | --- |
+| `POST /export-to-mart-refresh` | 首轮分区刷新，支持 `fail_after` 模拟中断、`empty_partitions`/`fail_partitions` 注入场景 |
+| `POST /export-to-mart-resume` | 按 `batch_id` 续做，只重建失败/未处理分区 |
+| `POST /export-to-mart-deliver` | 按续做覆盖清单交付分区文件/零行标记/缺口记录 |
+| `GET /mart-coverage/{mart_id}` | 查询集市当前实际可读分区范围与批次清单 |
+| `POST /mart-legacy-gap/{mart_id}` | 给无证据历史批标记核验缺口 |
+
+端到手工验证脚本：`backend/scripts/e2e_mart_resume.py`；测试：`backend/tests/test_mart_resume.py`。
+
 领域：数据工程
 子方向：数据分析与数据应用
